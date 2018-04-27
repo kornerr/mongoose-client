@@ -5,154 +5,86 @@
 
 #include "mongoose.h"
 
-static int s_exit_flag = 0;
-
-static void ev_handler(mg_connection *nc, int ev, void *ev_data)
-{
-    struct http_message *hm = (http_message *)ev_data;
-
-    switch (ev)
-    {
-        case MG_EV_CONNECT:
-            if (*(int *) ev_data != 0)
-            {
-                fprintf(stderr, "connect() failed: %s\n", strerror(*(int *) ev_data));
-                s_exit_flag = 1;
-            }
-            break;
-        case MG_EV_HTTP_REPLY:
-            {
-                nc->flags |= MG_F_CLOSE_IMMEDIATELY;
-                auto body = std::string(hm->body.p, hm->body.len);
-                printf("HTTP reply: '%s'\n", body.c_str());
-                s_exit_flag = 1;
-                break;
-            }
-        case MG_EV_CLOSE:
-            if (s_exit_flag == 0)
-            {
-                printf("Server closed connection\n");
-                s_exit_flag = 1;
-            }
-            break;
-        default:
-            break;
-    }
-}
-
-/*
-int main(int argc, char *argv[])
-{
-    if (argc < 2)
-    {
-        fprintf(stderr, "Usage: %s <URL>\n", argv[0]);
-        return 1;
-    }
-    auto url = argv[1];
-
-    mg_mgr mgr;
-    mg_mgr_init(&mgr, 0);
-
-    mg_connect_http(&mgr, ev_handler, url, 0, 0);
-
-    while (s_exit_flag == 0)
-    {
-        mg_mgr_poll(&mgr, 1000);
-        std::cout << "Checking\n";
-    }
-    mg_mgr_free(&mgr);
-
-    return 0;
-}
-
-*/
-
-
 class HTTPClient
 {
     public:
-        HTTPClient()
+        typedef std::function<void(std::string)> Callback;
+
+        HTTPClient(Callback success, Callback failure) :
+            success(success),
+            failure(failure),
+            inProgress(false)
         {
             mg_mgr_init(&this->client, 0);
-            // Save 'this' point to Mongoose manager
-            // for later callback referencing.
-            this->client.user_data = this;
         }
         ~HTTPClient()
         {
-            this->client.user_data = 0;
             mg_mgr_free(&this->client);
         }
 
-        typedef std::function<void(const std::string &)> Callback;
-
         // Only does GET requests.
-        // TODO Introduce 'type' to perform POST requests as well.
-        void request(const std::string &url, Callback success, Callback failure)
+        // NOTE Introduce 'type' to perform POST requests as well?
+        void request(const std::string &url)
         {
-            mg_connect_http(&this->client, handleEvent, url.c_str(), 0, 0);
-            this->requests.insert(
-                std::pair<std::string, RequestCallbacks>(
-                    url, {success, failure}
-                )
-            );
+            auto connection = mg_connect_http(&this->client, handleEvent, url.c_str(), 0, 0);
+            // Save 'this' point to the conection
+            // for later referencing in callbacks.
+            connection->user_data = this;
+            this->inProgress = true;
+        }
+
+        bool needsProcessing()
+        {
+            return this->inProgress;
+        }
+
+        void process()
+        {
+            mg_mgr_poll(&this->client, 1000);
         }
 
     private:
-        struct RequestCallbacks
-        {
-            /*
-            Request(
-                const std::string &url,
-                Callback success,
-                Callback failure
-            ) :
-                url(url),
-                success(success),
-                failure(failure)
-            { }
-            */
-                    
-            Callback success;
-            Callback failure;
-        };
-
         mg_mgr client;
-        std::map<std::string, RequestCallbacks> requests;
+        Callback success;
+        Callback failure;
+        bool inProgress;
 
-        static void handleEvent(mg_connection *conn, int event, void *data)
+        static void handleEvent(mg_connection *connection, int event, void *data)
         {
-            auto msg = static_cast<http_message *>(data);
-            /*
+            auto instance = reinterpret_cast<HTTPClient *>(connection->user_data);
             switch (event)
             {
                 case MG_EV_CONNECT:
-                    if (*(int *)data != 0)
                     {
-                        fprintf(stderr, "connect() failed: %s\n", strerror(*(int *) ev_data));
-                        s_exit_flag = 1;
+                        auto status = *static_cast<int *>(data);
+                        if (status != 0)
+                        {
+                            //instance->failure(strerror(status));
+                            instance->failure("Failed to connect");
+                            instance->inProgress = false;
+                        }
                     }
                     break;
                 case MG_EV_HTTP_REPLY:
                     {
-                        nc->flags |= MG_F_CLOSE_IMMEDIATELY;
-                        auto body = std::string(hm->body.p, hm->body.len);
-                        printf("HTTP reply: '%s'\n", body.c_str());
-                        s_exit_flag = 1;
-                        break;
+                        connection->flags |= MG_F_CLOSE_IMMEDIATELY;
+                        auto msg = static_cast<http_message *>(data);
+                        auto body = std::string(msg->body.p, msg->body.len);
+                        instance->inProgress = false;
+                        instance->success(body);
                     }
+                    break;
                 case MG_EV_CLOSE:
-                    if (s_exit_flag == 0)
+                    // Only report failure if CLOSE event precedes REPLY one.
+                    if (instance->inProgress)
                     {
-                        printf("Server closed connection\n");
-                        s_exit_flag = 1;
+                        instance->failure("Server closed connection");
                     }
+                    instance->inProgress = false;
                     break;
                 default:
                     break;
             }
-            */
-
         }
 };
 
@@ -165,22 +97,22 @@ int main(int argc, char *argv[])
     }
     auto url = argv[1];
 
-    HTTPClient client;
-    client.request(
-        url,
-        [&](const std::string &body) {
-            printf("Received HTTP reply: '%s'", body.c_str());
-        },
-        [&](const std::string &reason) {
-            printf("ERROR: '%s'", reason.c_str());
-        }
-    );
-    /*
+    auto successCallback = [=](std::string body) {
+        printf("success\n");
+        printf("Received HTTP reply: '%s'\n", body.c_str());
+    };
+    auto failureCallback = [=](std::string reason) {
+        printf("failure\n");
+        printf("ERROR Failed to perform request: '%s'\n", reason.c_str());
+    };
+
+    HTTPClient client(successCallback, failureCallback);
+    client.request(url);
+
     while (client.needsProcessing())
     {
         client.process();
     }
-    */
 
     return 0;
 }
